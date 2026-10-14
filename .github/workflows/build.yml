@@ -1,0 +1,172 @@
+# Builds one distro for linuxlive.com's "Build it for me". linuxlive.com puts
+# a Workshop spec and its art on a branch build/<id> of this repository and
+# starts this workflow on that branch. The build itself is linuxlive's
+# reusable workflow, the same one every distro uses: it boots the ISO five
+# ways, installs it and checks the result. A spec that runs code of its own
+# (scripts or GitHub repos) is refused before anything is built.
+#
+# The ISO, its SHA-256, its package list, the desktop's screenshot and
+# build.json go to R2 as builds/<id>/ (downloads.linuxlive.com/builds/<id>/).
+# cleanup.yml deletes them, the branch and the Fedora image after 30 days.
+name: build
+run-name: "Build: ${{ inputs.title }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      title:
+        description: The distro's name, shown in the list of runs
+        type: string
+        default: a distro
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  guard:
+    runs-on: ubuntu-24.04
+    outputs:
+      id: ${{ steps.id.outputs.id }}
+    steps:
+      - id: id
+        name: The build's name, from its branch
+        env:
+          REF: ${{ github.ref_name }}
+        run: |
+          case "$REF" in build/*) ;; *) echo "Only build/<id> branches are built here." >&2; exit 1 ;; esac
+          id=${REF#build/}
+          [[ $id =~ ^[a-z0-9][a-z0-9-]{0,38}-[a-z0-9]{6}$ ]] || { echo "Bad build name $id." >&2; exit 1; }
+          echo "id=$id" >>"$GITHUB_OUTPUT"
+      - uses: actions/checkout@v7
+        with:
+          path: distro
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Only the kit's files changed
+        working-directory: distro
+        run: |
+          changed=$(git diff --name-only origin/main...HEAD)
+          printf '%s\n' "$changed"
+          bad=$(printf '%s\n' "$changed" | grep -Ev '^(linuxlive\.yaml|assets/(wallpaper\.(png|jpg)|logo\.png)|files/[A-Za-z0-9_][A-Za-z0-9._-]{0,99})$' || true)
+          if [ -n "$bad" ]; then
+            echo "This branch changes more than a distro kit: $bad" >&2
+            exit 1
+          fi
+      - uses: actions/checkout@v7
+        with:
+          repository: Eric-Ness/linuxlive
+          ref: v0.4.0
+          path: linuxlive
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install -r linuxlive/requirements.txt
+      - name: No code of its own
+        env:
+          PYTHONPATH: linuxlive
+        run: |
+          python -m linuxlive validate distro/linuxlive.yaml
+          python - <<'PY'
+          from linuxlive.spec import load_spec
+
+          spec = load_spec("distro/linuxlive.yaml")
+          if spec.runs_own_code:
+              raise SystemExit("This spec has scripts or GitHub repos. linuxlive.com builds only distros without code of their own; build it in your own GitHub instead.")
+          print(f"{spec.name} {spec.version}: no code of its own")
+          PY
+
+  build:
+    needs: guard
+    permissions:
+      contents: read
+      # Fedora-based distros install and update from their published image.
+      packages: write
+    uses: Eric-Ness/linuxlive/.github/workflows/build.yml@v0.4.0
+    with:
+      spec: linuxlive.yaml
+      name: ${{ needs.guard.outputs.id }}
+      keep-iso: true
+      iso-retention-days: 1
+      publish-image: true
+
+  publish:
+    needs: [guard, build]
+    runs-on: ubuntu-24.04
+    env:
+      ID: ${{ needs.guard.outputs.id }}
+      BUCKET: ${{ vars.R2_BUCKET || 'linuxlive-downloads' }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+      # Newer AWS CLIs add checksum headers R2 can reject; send them only when an API requires them.
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: iso-${{ needs.guard.outputs.id }}
+          path: iso
+      - uses: actions/download-artifact@v7
+        with:
+          name: results-${{ needs.guard.outputs.id }}
+          path: results
+      - name: Check the ISO against its SHA-256
+        working-directory: iso
+        run: sha256sum -c "$ID.iso.sha256" && test -s "$ID.iso.packages"
+      - name: Describe the build
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+
+          iid = os.environ["ID"]
+          iso = Path("iso") / f"{iid}.iso"
+          meta = json.loads(Path("results/meta.json").read_text())
+          session = json.loads(Path("results/modes/uefi-usb/result.json").read_text())
+          boots = {}
+          for mode in sorted(p.name for p in Path("results/modes").iterdir()):
+              r = json.loads((Path("results/modes") / mode / "result.json").read_text())
+              boots[mode] = r.get("outcome")
+          base = f"https://downloads.linuxlive.com/builds/{iid}"
+          desc = {
+              "id": iid,
+              "run": {"id": os.environ["GITHUB_RUN_ID"], "url": f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"},
+              "base": meta.get("base"),
+              "linuxlive": meta.get("linuxlive", {}).get("ref"),
+              "iso": {"url": f"{base}/{iid}.iso", "bytes": iso.stat().st_size, "sha256": Path(f"{iso}.sha256").read_text().split()[0]},
+              "packages": f"{base}/{iid}.iso.packages",
+              "screen": f"{base}/screen.png",
+              "osPrettyName": (session.get("facts", {}).get("os_pretty_name") or [None])[0],
+              "installable": (session.get("facts", {}).get("installer_icon") or [None])[0] == "desktop",
+              "boots": boots,
+          }
+          Path("build.json").write_text(json.dumps(desc, indent=2))
+          print(json.dumps(desc, indent=2))
+          PY
+      - name: Upload to R2
+        run: |
+          key="builds/$ID"
+          # Every build has a new name, so browsers and Cloudflare may cache it until it is deleted.
+          cache="public, max-age=31536000, immutable"
+          aws s3 cp "iso/$ID.iso" "s3://$BUCKET/$key/$ID.iso" --endpoint-url "$R2_ENDPOINT" \
+            --content-type application/x-iso9660-image --cache-control "$cache" --no-progress
+          aws s3 cp "iso/$ID.iso.sha256" "s3://$BUCKET/$key/$ID.iso.sha256" --endpoint-url "$R2_ENDPOINT" \
+            --content-type text/plain --cache-control "$cache" --no-progress
+          aws s3 cp "iso/$ID.iso.packages" "s3://$BUCKET/$key/$ID.iso.packages" --endpoint-url "$R2_ENDPOINT" \
+            --content-type "text/plain; charset=utf-8" --cache-control "$cache" --no-progress
+          aws s3 cp "results/modes/uefi-usb/screenshot-1.png" "s3://$BUCKET/$key/screen.png" --endpoint-url "$R2_ENDPOINT" \
+            --content-type image/png --cache-control "$cache" --no-progress
+          # Last, so build.json appearing means everything else is there.
+          aws s3 cp build.json "s3://$BUCKET/$key/build.json" --endpoint-url "$R2_ENDPOINT" \
+            --content-type application/json --cache-control "public, max-age=300" --no-progress
+          echo "https://downloads.linuxlive.com/$key/$ID.iso" >>"$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,67 @@
+# Deletes builds older than DAYS days: the ISO and its files in R2
+# (builds/<id>/), the Fedora image on ghcr.io, and the build/<id> branch.
+# Daily, and by hand from the Actions tab (a dry run lists what it would delete).
+name: cleanup
+
+on:
+  schedule:
+    - cron: "23 6 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Only list what would be deleted
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: cleanup
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # Keep in step with BUILD_DAYS in linuxlive.com's Worker (src/worker/index.js).
+  DAYS: 30
+  DRY_RUN: ${{ inputs.dry_run == true }}
+  GH_TOKEN: ${{ github.token }}
+  BUCKET: ${{ vars.R2_BUCKET || 'linuxlive-downloads' }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+  AWS_DEFAULT_REGION: auto
+  R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+  AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+  AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Delete old builds
+        run: |
+          cutoff=$(date -u -d "$DAYS days ago" +%s)
+          owner=${GITHUB_REPOSITORY%%/*}
+          repo=${GITHUB_REPOSITORY#*/}
+          gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/heads/build/" --jq '.[] | .ref + " " + .object.sha' |
+          while read -r ref sha; do
+            id=${ref#refs/heads/build/}
+            [[ $id =~ ^[a-z0-9][a-z0-9-]{0,38}-[a-z0-9]{6}$ ]] || { echo "skipping $ref"; continue; }
+            made=$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$sha" --jq .committer.date)
+            if [ "$(date -u -d "$made" +%s)" -ge "$cutoff" ]; then
+              echo "keep $id (built $made)"
+              continue
+            fi
+            echo "delete $id (built $made)"
+            echo "- deleted $id, built $made" >>"$GITHUB_STEP_SUMMARY"
+            [ "$DRY_RUN" = true ] && continue
+            aws s3 rm "s3://$BUCKET/builds/$id/" --recursive --endpoint-url "$R2_ENDPOINT"
+            # Fedora builds published ghcr.io/<owner>/<repo>/<id>; Ubuntu builds have none.
+            gh api -X DELETE "users/$owner/packages/container/$(printf '%s' "$repo/$id" | jq -sRr @uri)" >/dev/null 2>&1 ||
+              echo "  no image to delete for $id (or it could not be deleted)"
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/build/$id" >/dev/null
+          done
