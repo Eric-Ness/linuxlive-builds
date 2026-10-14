@@ -63,7 +63,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           repository: Eric-Ness/linuxlive
-          ref: v0.4.1
+          ref: v0.4.2
           path: linuxlive
           persist-credentials: false
       - uses: actions/setup-python@v7
@@ -90,7 +90,7 @@ jobs:
       contents: read
       # Fedora-based distros install and update from their published image.
       packages: write
-    uses: Eric-Ness/linuxlive/.github/workflows/build.yml@v0.4.1
+    uses: Eric-Ness/linuxlive/.github/workflows/build.yml@v0.4.2
     with:
       spec: linuxlive.yaml
       name: ${{ needs.guard.outputs.id }}
