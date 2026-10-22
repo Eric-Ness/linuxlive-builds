@@ -6,6 +6,8 @@ in the Workshop, and a run of [build.yml](.github/workflows/build.yml) on that
 branch: the same reusable
 [linuxlive](https://github.com/Eric-Ness/linuxlive) build every distro uses,
 which boots the ISO five ways, installs it to a disk and checks the result.
+Builds use linuxlive v0.9.1; a distro that asks for ARM64 gets a second ISO,
+`<id>-arm64.iso`, beside the PC one.
 
 - Everything here is public: the branches, the runs and the ISOs, at
   `https://downloads.linuxlive.com/builds/<id>/`.

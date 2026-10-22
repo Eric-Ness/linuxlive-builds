@@ -60,8 +60,11 @@ jobs:
             echo "- deleted $id, built $made" >>"$GITHUB_STEP_SUMMARY"
             [ "$DRY_RUN" = true ] && continue
             aws s3 rm "s3://$BUCKET/builds/$id/" --recursive --endpoint-url "$R2_ENDPOINT"
-            # Fedora builds published ghcr.io/<owner>/<repo>/<id>; Ubuntu builds have none.
-            gh api -X DELETE "users/$owner/packages/container/$(printf '%s' "$repo/$id" | jq -sRr @uri)" >/dev/null 2>&1 ||
-              echo "  no image to delete for $id (or it could not be deleted)"
+            # Fedora builds published ghcr.io/<owner>/<repo>/<id>, and <id>-arm64 with an
+            # arm64 ISO; Ubuntu builds have none.
+            for image in "$id" "$id-arm64"; do
+              gh api -X DELETE "users/$owner/packages/container/$(printf '%s' "$repo/$image" | jq -sRr @uri)" >/dev/null 2>&1 ||
+                echo "  no image to delete for $image (or it could not be deleted)"
+            done
             gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/build/$id" >/dev/null
           done
